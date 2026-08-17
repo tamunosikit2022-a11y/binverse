@@ -2,43 +2,65 @@ package com.binverse.vision.camera
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.binverse.vision.AppConfig
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 /**
- * Owns the CameraX pipeline. The preview runs continuously; frames are only
- * pulled out for AI analysis on a fixed interval (never every frame), and
- * only when analysis is not already in flight.
+ * Owns the CameraX pipeline. The preview runs continuously; still frames are
+ * pulled out for AI analysis via ImageCapture -- CameraX's native JPEG
+ * capture path -- on a fixed interval (never every preview frame), and only
+ * when a capture is not already in flight.
+ *
+ * NOTE: this intentionally uses ImageCapture rather than hand-decoding
+ * ImageAnalysis's raw YUV_420_888 buffers. A naive YUV->NV21 byte copy
+ * (as an earlier version of this file did) assumes a specific chroma
+ * plane memory layout that most real camera sensors don't actually use
+ * (interleaved U/V with pixelStride > 1), which silently produces
+ * wrong-colored/corrupted JPEGs on many devices -- exactly the kind of
+ * thing that degrades a vision model's classification quality without
+ * throwing any error. ImageCapture avoids that entirely by returning an
+ * already correctly-encoded JPEG straight from the camera stack.
  */
 class BinVerseCameraManager(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner
 ) {
-    private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val captureExecutor = Executors.newSingleThreadExecutor()
+    private val scope = CoroutineScope(Dispatchers.Default)
+
     private var cameraProvider: ProcessCameraProvider? = null
-    private var imageAnalysis: ImageAnalysis? = null
+    private var imageCapture: ImageCapture? = null
+    private var captureLoopJob: Job? = null
 
     @Volatile private var captureIntervalMs: Long = AppConfig.DEFAULT_CAPTURE_INTERVAL_MS
     @Volatile private var autoCaptureEnabled = false
     @Volatile private var frameDiffFilterEnabled = false
+    @Volatile private var forceNextFrame = false
 
-    private val lastCaptureTime = AtomicLong(0L)
     private val busy = AtomicBoolean(false)
     private var lastLumaSample: IntArray? = null
 
-    /** Called with a ready-to-upload JPEG byte array, or null if a frame was skipped by the prefilter. */
+    /** Called with a ready-to-upload JPEG byte array. */
     var onFrameCaptured: ((ByteArray) -> Unit)? = null
     var onFrameSkippedByPrefilter: (() -> Unit)? = null
 
@@ -65,67 +87,79 @@ class BinVerseCameraManager(
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
 
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                val capture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .build()
-                analysis.setAnalyzer(analysisExecutor) { proxy -> onFrame(proxy) }
-                imageAnalysis = analysis
+                imageCapture = capture
 
                 val selector = CameraSelector.DEFAULT_BACK_CAMERA
 
                 provider.unbindAll()
-                provider.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
+                provider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
+
+                startCaptureLoop()
             } catch (e: Exception) {
                 onError(e.message ?: "Failed to start camera")
             }
-        }, androidx.core.content.ContextCompat.getMainExecutor(context))
+        }, ContextCompat.getMainExecutor(context))
     }
 
-    /** Manual "ANALYZE NOW": force the very next frame through regardless of interval/prefilter. */
-    @Volatile private var forceNextFrame = false
+    /** Manual "ANALYZE NOW": force the very next loop tick to capture regardless of interval/prefilter/auto-detect state. */
     fun requestImmediateAnalysis() {
         forceNextFrame = true
     }
 
-    private fun onFrame(proxy: ImageProxy) {
-        val now = System.currentTimeMillis()
-        val due = autoCaptureEnabled && (now - lastCaptureTime.get() >= captureIntervalMs)
-
-        if (!forceNextFrame && !due) {
-            proxy.close()
-            return
-        }
-        if (busy.get()) {
-            // Previous frame still uploading/processing — never queue extra work.
-            proxy.close()
-            return
-        }
-
-        val forced = forceNextFrame
-        forceNextFrame = false
-        lastCaptureTime.set(now)
-        busy.set(true)
-
-        try {
-            val bitmap = proxy.toResizedBitmap(AppConfig.UPLOAD_MAX_DIMENSION_PX)
-
-            if (!forced && frameDiffFilterEnabled && !frameChangedEnough(bitmap)) {
-                onFrameSkippedByPrefilter?.invoke()
-                busy.set(false)
-                return
+    private fun startCaptureLoop() {
+        captureLoopJob?.cancel()
+        captureLoopJob = scope.launch {
+            while (isActive) {
+                val due = autoCaptureEnabled || forceNextFrame
+                if (due && !busy.get()) {
+                    captureOnce(forced = forceNextFrame)
+                    forceNextFrame = false
+                }
+                delay(minOf(captureIntervalMs, 250L).coerceAtLeast(100L))
             }
-
-            val jpeg = bitmap.toJpegBytes(AppConfig.UPLOAD_JPEG_QUALITY)
-            onFrameCaptured?.invoke(jpeg)
-        } catch (e: Exception) {
-            // Fail safe: swallow and let the caller's timeout/error handling take over.
-        } finally {
-            busy.set(false)
-            proxy.close()
         }
     }
 
-    /** Cheap luma-histogram diff over a coarse grid — good enough to detect "basically nothing changed". */
+    private fun captureOnce(forced: Boolean) {
+        val capture = imageCapture ?: return
+        if (!busy.compareAndSet(false, true)) return
+
+        capture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    val jpegBytes = image.toOriginalJpegBytes()
+                    var bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                    val rotation = image.imageInfo.rotationDegrees
+                    if (rotation != 0) {
+                        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                        bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                    }
+                    bitmap = bitmap.resizedTo(AppConfig.UPLOAD_MAX_DIMENSION_PX)
+
+                    if (!forced && frameDiffFilterEnabled && !frameChangedEnough(bitmap)) {
+                        onFrameSkippedByPrefilter?.invoke()
+                    } else {
+                        val outJpeg = bitmap.toJpegBytes(AppConfig.UPLOAD_JPEG_QUALITY)
+                        onFrameCaptured?.invoke(outJpeg)
+                    }
+                } catch (e: Exception) {
+                    // Fail safe: swallow -- the caller's own timeout/error handling covers this.
+                } finally {
+                    image.close()
+                    busy.set(false)
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                busy.set(false)
+            }
+        })
+    }
+
+    /** Cheap luma-histogram diff over a coarse grid -- good enough to detect "basically nothing changed". */
     private fun frameChangedEnough(bitmap: Bitmap): Boolean {
         val gridW = 16
         val gridH = 12
@@ -158,47 +192,26 @@ class BinVerseCameraManager(
     }
 
     fun stop() {
+        captureLoopJob?.cancel()
         cameraProvider?.unbindAll()
-        analysisExecutor.shutdown()
+        captureExecutor.shutdown()
     }
 }
 
-private fun ImageProxy.toResizedBitmap(maxDimension: Int): Bitmap {
-    val bitmap = this.toBitmapCompat()
-    val largestSide = maxOf(bitmap.width, bitmap.height)
-    if (largestSide <= maxDimension) return bitmap
+/** ImageCapture's default output format is JPEG, so plane 0's buffer IS the encoded JPEG stream already. */
+private fun ImageProxy.toOriginalJpegBytes(): ByteArray {
+    val buffer = planes[0].buffer
+    val bytes = ByteArray(buffer.remaining())
+    buffer.get(bytes)
+    return bytes
+}
+
+private fun Bitmap.resizedTo(maxDimension: Int): Bitmap {
+    val largestSide = maxOf(width, height)
+    if (largestSide <= maxDimension) return this
     val scale = maxDimension.toFloat() / largestSide
     val matrix = Matrix().apply { postScale(scale, scale) }
-    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-}
-
-/** Converts the analyzer's YUV ImageProxy into an RGB Bitmap, applying sensor rotation. */
-private fun ImageProxy.toBitmapCompat(): Bitmap {
-    val yBuffer = planes[0].buffer
-    val uBuffer = planes[1].buffer
-    val vBuffer = planes[2].buffer
-
-    val ySize = yBuffer.remaining()
-    val uSize = uBuffer.remaining()
-    val vSize = vBuffer.remaining()
-
-    val nv21 = ByteArray(ySize + uSize + vSize)
-    yBuffer.get(nv21, 0, ySize)
-    vBuffer.get(nv21, ySize, vSize)
-    uBuffer.get(nv21, ySize + vSize, uSize)
-
-    val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
-    val out = ByteArrayOutputStream()
-    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
-    val bytes = out.toByteArray()
-    var bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-
-    val rotation = imageInfo.rotationDegrees
-    if (rotation != 0) {
-        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-        bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-    }
-    return bmp
+    return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
 }
 
 private fun Bitmap.toJpegBytes(quality: Int): ByteArray {
