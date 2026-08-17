@@ -52,15 +52,60 @@ object DetectionParser {
         }
     }
 
-    /** Groq's JSON-mode responses are normally a bare object, but strip any stray markdown fencing defensively. */
+    /**
+     * Extracts the first complete, balanced JSON object from Groq's raw
+     * response text.
+     *
+     * This does proper brace-depth counting (correctly ignoring braces that
+     * appear inside quoted strings) rather than naively taking the text
+     * between the first '{' and the last '}'. That naive approach breaks
+     * as soon as the model wraps the JSON in any surrounding sentence
+     * (e.g. "Here's the result: {...} let me know if you need more!") --
+     * which became common once strict JSON mode was removed from the Groq
+     * request (see GroqVisionService) to work around a separate Groq 400
+     * error. Any stray brace in the surrounding prose would otherwise
+     * corrupt the extracted span and fail to parse.
+     */
     private fun extractJsonObject(text: String): String? {
         val trimmed = text.trim()
         val fenced = Regex("```(?:json)?\\s*([\\s\\S]*?)```").find(trimmed)?.groupValues?.get(1)?.trim()
         val candidate = fenced ?: trimmed
+
         val start = candidate.indexOf('{')
-        val end = candidate.lastIndexOf('}')
-        if (start == -1 || end == -1 || end < start) return null
-        return candidate.substring(start, end + 1)
+        if (start == -1) return null
+
+        var depth = 0
+        var inString = false
+        var escapeNext = false
+
+        for (i in start until candidate.length) {
+            val c = candidate[i]
+
+            if (escapeNext) {
+                escapeNext = false
+                continue
+            }
+
+            when {
+                inString -> when (c) {
+                    '\\' -> escapeNext = true
+                    '"' -> inString = false
+                }
+                else -> when (c) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) {
+                            return candidate.substring(start, i + 1)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Unbalanced braces -- the model's output was truncated or malformed.
+        return null
     }
 
     /**
