@@ -75,7 +75,23 @@ class GroqVisionService {
             put("model", model)
             put("messages", messages)
             put("temperature", 0.2)
-            put("max_tokens", 200)
+            put("max_tokens", 400)
+            // qwen/qwen3.6-27b is a hybrid thinking/non-thinking model and
+            // reasons by default. Left unset, it burns a large chunk (often
+            // all) of max_tokens on internal reasoning before ever emitting
+            // the JSON answer, which was the actual cause of both the
+            // "invalid response / cannot parse JSON" errors (truncated
+            // output) AND premature Groq rate-limit hits (reasoning tokens
+            // count against the per-minute token budget same as output).
+            // This is a single-label classification task -- it needs none
+            // of that, so thinking mode is explicitly disabled. Groq only
+            // accepts "default" or "none" for this model's reasoning_effort.
+            put("reasoning_effort", "none")
+            // Belt-and-braces: if a future default model still emits any
+            // reasoning content despite reasoning_effort, keep it out of
+            // the message content entirely rather than relying solely on
+            // DetectionParser to strip it out.
+            put("reasoning_format", "hidden")
             // NOTE: Groq's strict JSON-mode "response_format": {"type":"json_object"}
             // is intentionally NOT sent here. qwen/qwen3.6-27b was observed
             // returning HTTP 400 "json_validate_failed" with an empty
@@ -132,9 +148,13 @@ class GroqVisionService {
                         401, 403 -> cont.resumeWith(Result.success(
                             GroqResult.Error(GroqErrorReason.AUTH_FAILURE, "Groq authentication failed (HTTP ${resp.code})")
                         ))
-                        429 -> cont.resumeWith(Result.success(
-                            GroqResult.Error(GroqErrorReason.RATE_LIMIT, "Groq rate limit reached (HTTP 429)")
-                        ))
+                        429 -> {
+                            val retryAfter = resp.header("retry-after")
+                            val suffix = retryAfter?.let { " — retry after ${it}s" } ?: ""
+                            cont.resumeWith(Result.success(
+                                GroqResult.Error(GroqErrorReason.RATE_LIMIT, "Groq rate limit reached (HTTP 429)$suffix")
+                            ))
+                        }
                         else -> cont.resumeWith(Result.success(
                             GroqResult.Error(GroqErrorReason.UNKNOWN, "Groq error HTTP ${resp.code}: ${text.take(200)}")
                         ))
