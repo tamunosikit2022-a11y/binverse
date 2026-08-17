@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.BinVerseVision" parent="android:Theme.Material.NoActionBar" />
+</resources>
